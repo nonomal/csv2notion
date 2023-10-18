@@ -4,7 +4,7 @@ interactions:
     headers:
       Content-Length:
       - '2'
-      Content-Type:
+      content-type:
       - application/json
       cookie:
       - PRIVATE
@@ -12,7 +12,7 @@ interactions:
     uri: https://www.notion.so/api/v3/loadUserContent
   response:
     body:
-      string: '{"errorId":"6a4f4f33-e9b9-4a7b-b48d-36390fd9e0a6","name":"UnauthorizedError","message":"Could
+      string: '{"errorId":"92cb1de9-8f77-41d4-8f3a-3970bdb6340e","name":"UnauthorizedError","message":"Could
         not decrypt token."}'
     headers:
       Content-Length:

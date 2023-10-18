@@ -1,63 +1,74 @@
 import logging
-import os
-import re
 
 import pytest
 
-from csv2notion.cli import cli
-from csv2notion.utils import NotionError
+from csv2notion.utils_exceptions import NotionError
 
 
 @pytest.mark.vcr()
 @pytest.mark.usefixtures("vcr_uuid4")
-def test_fail_on_conversion_error(tmp_path, db_maker):
+def test_fail_on_conversion_error(tmp_path, db_maker, caplog):
     test_file = tmp_path / f"{db_maker.page_name}.csv"
     test_file.write_text("a,b\na,not_a_number")
 
-    with pytest.raises(NotionError) as e:
-        cli(
-            [
-                "--token",
-                db_maker.token,
-                "--fail-on-conversion-error",
-                "--custom-types",
-                "number",
-                str(test_file),
-            ]
+    with caplog.at_level(logging.INFO, logger="csv2notion"):
+        e = db_maker.from_raising_cli(
+            "--token",
+            db_maker.token,
+            "--fail-on-conversion-error",
+            "--column-types",
+            "number",
+            str(test_file),
         )
 
-    assert "CSV [2]: could not convert string to float: 'not_a_number'" in str(e.value)
+    assert isinstance(e.raised, NotionError)
+    assert "Error during conversion" in str(e.raised)
+    assert "CSV [2]: could not convert string to float: 'not_a_number'" in caplog.text
 
 
 @pytest.mark.vcr()
 @pytest.mark.usefixtures("vcr_uuid4")
-def test_fail_on_conversion_error_ok(tmp_path, caplog, db_maker):
+def test_fail_on_conversion_error_empty(tmp_path, db_maker):
     test_file = tmp_path / f"{db_maker.page_name}.csv"
-    test_file.write_text("a,b\na,123")
+    test_file.write_text("a,b\na,")
 
-    with caplog.at_level(logging.INFO, logger="csv2notion"):
-        cli(
-            [
-                "--token",
-                db_maker.token,
-                "--fail-on-conversion-error",
-                "--custom-types",
-                "number",
-                str(test_file),
-            ]
-        )
-
-    url = re.search(r"New database URL: (.*)$", caplog.text, re.M)[1]
-
-    test_db = db_maker.from_url(url)
-
-    table_rows = test_db.rows
-    table_header = test_db.header
+    test_db = db_maker.from_cli(
+        "--token",
+        db_maker.token,
+        "--fail-on-conversion-error",
+        "--column-types",
+        "number",
+        str(test_file),
+    )
 
     assert test_db.schema_dict["b"]["type"] == "number"
 
-    assert table_header == {"a", "b"}
-    assert len(table_rows) == 1
+    assert test_db.header == {"a", "b"}
+    assert len(test_db.rows) == 1
 
-    assert getattr(table_rows[0], "a") == "a"
-    assert getattr(table_rows[0], "b") == 123
+    assert test_db.rows[0].columns["a"] == "a"
+    assert test_db.rows[0].columns["b"] is None
+
+
+@pytest.mark.vcr()
+@pytest.mark.usefixtures("vcr_uuid4")
+def test_fail_on_conversion_error_ok(tmp_path, db_maker):
+    test_file = tmp_path / f"{db_maker.page_name}.csv"
+    test_file.write_text("a,b\na,123")
+
+    test_db = db_maker.from_cli(
+        "--token",
+        db_maker.token,
+        "--fail-on-conversion-error",
+        "--column-types",
+        "number",
+        str(test_file),
+    )
+
+    assert test_db.schema_dict["b"]["type"] == "number"
+
+    assert test_db.header == {"a", "b"}
+    assert len(test_db.rows) == 1
+
+    assert test_db.rows[0].columns["a"] == "a"
+    assert test_db.rows[0].columns["b"] == 123

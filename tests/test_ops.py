@@ -1,27 +1,25 @@
 import logging
-import os
-import re
 from pathlib import Path
 
 import pytest
 
 from csv2notion.cli import cli, main
-from csv2notion.utils import CriticalError, NotionError
+from csv2notion.utils_exceptions import CriticalError, NotionError
 
 
 def test_no_args():
     with pytest.raises(SystemExit):
-        cli([])
+        cli()
 
 
 def test_help():
     with pytest.raises(SystemExit):
-        cli(["--help"])
+        cli("--help")
 
 
 def test_missing_csv():
     with pytest.raises(CriticalError) as e:
-        cli(["--token", "fake", "fake.csv"])
+        cli("--token", "fake", "fake.csv")
 
     assert "File fake.csv not found" in str(e.value)
 
@@ -31,7 +29,17 @@ def test_empty_csv(tmp_path):
     test_file.touch()
 
     with pytest.raises(CriticalError) as e:
-        cli(["--token", "fake", str(test_file)])
+        cli("--token", "fake", str(test_file))
+
+    assert "CSV file has no columns" in str(e.value)
+
+
+def test_no_rows_csv(tmp_path):
+    test_file = tmp_path / "test.csv"
+    test_file.write_text("a,b,c\n")
+
+    with pytest.raises(CriticalError) as e:
+        cli("--token", "fake", str(test_file))
 
     assert "CSV file is empty" in str(e.value)
 
@@ -42,7 +50,7 @@ def test_bad_token(tmp_path):
     test_file.write_text("a,b,c\n1,2,3\n")
 
     with pytest.raises(NotionError) as e:
-        cli(["--token", "fake", str(test_file)])
+        cli("--token", "fake", str(test_file))
 
     assert "Invalid Notion token" in str(e.value)
 
@@ -54,16 +62,35 @@ def test_bad_url(tmp_path, db_maker):
 
     with pytest.raises(NotionError) as e:
         cli(
-            [
-                "--token",
-                db_maker.token,
-                "--url",
-                "https://notnotion.com/bad_url",
-                str(test_file),
-            ]
+            "--token",
+            db_maker.token,
+            "--url",
+            "https://notnotion.com/bad_url",
+            str(test_file),
         )
 
     assert "Invalid URL" in str(e.value)
+
+
+@pytest.mark.vcr()
+def test_inaccessible_url(tmp_path, db_maker):
+    test_file = tmp_path / "test.csv"
+    test_file.write_text("a,b,c\na,b,c\n")
+    inaccessible_url = (
+        "https://www.notion.so/someuser/8e35d9a007b14dd1ae655df9ff6839f3"
+        "?v=6f0a1b89496f45209e99ececccd25b7a"
+    )
+
+    with pytest.raises(NotionError) as e:
+        cli(
+            "--token",
+            db_maker.token,
+            "--url",
+            inaccessible_url,
+            str(test_file),
+        )
+
+    assert "Cannot access" in str(e.value)
 
 
 @pytest.mark.vcr()
@@ -77,68 +104,95 @@ def test_bad_url_type(tmp_path, db_maker):
 
     with pytest.raises(NotionError) as e:
         cli(
-            [
-                "--token",
-                db_maker.token,
-                "--url",
-                test_row.get_browseable_url(),
-                str(test_file),
-            ]
+            "--token",
+            db_maker.token,
+            "--url",
+            test_row.get_browseable_url(),
+            str(test_file),
         )
 
-    assert "Provided URL links does not point to a Notion database" in str(e.value)
+    assert "Provided URL does not point to a Notion database" in str(e.value)
 
 
 @pytest.mark.vcr()
 @pytest.mark.usefixtures("vcr_uuid4")
-def test_new_page(tmp_path, caplog, db_maker):
+def test_read_only_url(tmp_path, db_maker):
+    test_file = tmp_path / "test.csv"
+    test_file.write_text("a,b,c\na,b,c\n")
+
+    read_only_url = (
+        "https://www.notion.so/vzhd1701/70ffd895eb1947b18bda9dacf535f67f?"
+        "v=c081db7615274caa9d90e6e8609fcda8"
+    )
+
+    with pytest.raises(NotionError) as e:
+        cli(
+            "--token",
+            db_maker.token,
+            "--url",
+            read_only_url,
+            str(test_file),
+        )
+
+    assert "You must have editing permissions for Notion database" in str(e.value)
+
+
+@pytest.mark.vcr()
+@pytest.mark.usefixtures("vcr_uuid4")
+def test_new_page(tmp_path, db_maker):
     test_file = tmp_path / f"{db_maker.page_name}.csv"
     test_file.write_text("a,b,c\na,b,c\n")
 
-    with caplog.at_level(logging.INFO, logger="csv2notion"):
-        cli(["--token", db_maker.token, str(test_file)])
-
-    url = re.search(r"New database URL: (.*)$", caplog.text, re.M)[1]
-
-    test_db = db_maker.from_url(url)
-
-    table_rows = test_db.rows
-    table_header = test_db.header
+    test_db = db_maker.from_cli("--token", db_maker.token, str(test_file))
 
     assert test_db.page.title == db_maker.page_name
     assert test_db.page.type == "collection_view_page"
 
-    assert table_header == {"a", "b", "c"}
-    assert len(table_rows) == 1
-    assert getattr(table_rows[0], "a") == "a"
-    assert getattr(table_rows[0], "b") == "b"
-    assert getattr(table_rows[0], "c") == "c"
+    assert test_db.header == {"a", "b", "c"}
+    assert len(test_db.rows) == 1
+    assert test_db.rows[0].columns["a"] == "a"
+    assert test_db.rows[0].columns["b"] == "b"
+    assert test_db.rows[0].columns["c"] == "c"
 
 
 @pytest.mark.vcr()
 @pytest.mark.usefixtures("vcr_uuid4")
-def test_new_page_column_order(tmp_path, caplog, db_maker):
+def test_new_page_empty_rows(tmp_path, db_maker):
+    test_file = tmp_path / f"{db_maker.page_name}.csv"
+    test_file.write_text("a,b,c\n\n\n,\n\n\n,,")
+
+    test_db = db_maker.from_cli(
+        "--token", db_maker.token, "--max-threads=1", str(test_file)
+    )
+
+    assert test_db.header == {"a", "b", "c"}
+    assert len(test_db.rows) == 2
+    assert test_db.rows[0].columns["a"] == ""
+    assert test_db.rows[0].columns["b"] == ""
+    assert test_db.rows[0].columns["c"] == ""
+    assert test_db.rows[1].columns["a"] == ""
+    assert test_db.rows[1].columns["b"] == ""
+    assert test_db.rows[1].columns["c"] == ""
+
+
+@pytest.mark.vcr()
+@pytest.mark.usefixtures("vcr_uuid4")
+def test_new_page_column_order(tmp_path, db_maker):
     test_file = tmp_path / f"{db_maker.page_name}.csv"
     test_file.write_text("c,b,a\nc,b,a\n")
 
-    with caplog.at_level(logging.INFO, logger="csv2notion"):
-        cli(["--token", db_maker.token, str(test_file)])
+    test_db = db_maker.from_cli("--token", db_maker.token, str(test_file))
 
-    url = re.search(r"New database URL: (.*)$", caplog.text, re.M)[1]
-
-    test_db = db_maker.from_url(url)
-
-    table_rows = test_db.rows
     table_view_header = test_db.default_view_header
 
     assert test_db.page.title == db_maker.page_name
     assert test_db.page.type == "collection_view_page"
 
     assert table_view_header == ["c", "b", "a"]
-    assert len(table_rows) == 1
-    assert getattr(table_rows[0], "a") == "a"
-    assert getattr(table_rows[0], "b") == "b"
-    assert getattr(table_rows[0], "c") == "c"
+    assert len(test_db.rows) == 1
+    assert test_db.rows[0].columns["a"] == "a"
+    assert test_db.rows[0].columns["b"] == "b"
+    assert test_db.rows[0].columns["c"] == "c"
 
 
 @pytest.mark.vcr()
@@ -150,23 +204,55 @@ def test_existing_page(tmp_path, db_maker):
     test_db = db_maker.from_csv_head("a,b,c")
 
     cli(
-        [
+        "--token",
+        db_maker.token,
+        "--url",
+        test_db.url,
+        str(test_file),
+    )
+
+    assert test_db.header == {"a", "b", "c"}
+    assert len(test_db.rows) == 1
+    assert test_db.rows[0].columns["a"] == "aa"
+    assert test_db.rows[0].columns["b"] == "bb"
+    assert test_db.rows[0].columns["c"] == "cc"
+
+
+@pytest.mark.vcr()
+@pytest.mark.usefixtures("vcr_uuid4")
+def test_inconsistent_columns_csv(tmp_path, db_maker, caplog):
+    test_file = tmp_path / f"{db_maker.page_name}.csv"
+    test_file.write_text("a,b\na,b,c\n")
+
+    with caplog.at_level(logging.WARNING, logger="csv2notion"):
+        test_db = db_maker.from_cli("--token", db_maker.token, str(test_file))
+
+    assert test_db.header == {"a", "b"}
+    assert len(test_db.rows) == 1
+    assert test_db.rows[0].columns["a"] == "a"
+    assert test_db.rows[0].columns["b"] == "b"
+
+    assert "Inconsistent number of columns detected" in caplog.text
+
+
+@pytest.mark.vcr()
+@pytest.mark.usefixtures("vcr_uuid4")
+def test_existing_page_column_mismatch(tmp_path, db_maker):
+    test_file = tmp_path / "test.csv"
+    test_file.write_text("a,b,c\naa,bb,cc\n")
+
+    test_db = db_maker.from_csv_head("d,e")
+
+    with pytest.raises(NotionError) as e:
+        cli(
             "--token",
             db_maker.token,
             "--url",
             test_db.url,
             str(test_file),
-        ]
-    )
+        )
 
-    table_header = {c["name"] for c in test_db.schema}
-    table_rows = test_db.rows
-
-    assert table_header == {"a", "b", "c"}
-    assert len(table_rows) == 1
-    assert getattr(table_rows[0], "a") == "aa"
-    assert getattr(table_rows[0], "b") == "bb"
-    assert getattr(table_rows[0], "c") == "cc"
+    assert "No columns left after validation, nothing to upload" in str(e.value)
 
 
 def test_log_file(fs, mocker):
@@ -194,4 +280,4 @@ def test_keyboard_interrupt(mocker):
 
 
 def test_main_import():
-    from csv2notion import __main__
+    from csv2notion import __main__  # noqa: F401, WPS433

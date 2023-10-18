@@ -1,315 +1,330 @@
+import logging
 from functools import partial
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
-from csv2notion.csv_data import CSVData
-from csv2notion.notion_convert_utils import (
-    TypeConversionError,
+from notion.user import User
+from notion.utils import InvalidNotionIdentifier, extract_id
+
+from csv2notion.csv_data import CSVData, CSVRowType
+from csv2notion.notion_convert_map import (
     map_checkbox,
     map_date,
     map_icon,
-    map_image,
+    map_notion_date,
     map_number,
+    map_url_or_file,
 )
-from csv2notion.notion_db import NotionDB, NotionUploadRow
-from csv2notion.utils import NotionError, split_str
+from csv2notion.notion_db import NotionDB
+from csv2notion.notion_row import CollectionRowBlockExtended
+from csv2notion.notion_type_guess import is_email
+from csv2notion.notion_uploader import NotionUploadRow
+from csv2notion.utils_exceptions import NotionError, TypeConversionError
+from csv2notion.utils_static import ConversionRules, FileType
+from csv2notion.utils_str import split_str
+
+logger = logging.getLogger(__name__)
 
 
-def _validate_csv_duplicates(csv_data):
-    first_column_values = [v[csv_data.keys()[0]] for v in csv_data]
-    if len(set(first_column_values)) != len(first_column_values):
-        raise NotionError("Duplicate values found in first column in CSV.")
-
-
-def _drop_columns(columns, csv_data: CSVData):
-    for column in columns:
-        csv_data.drop_column(column)
-
-
-class NotionRowConverter(object):
-    def __init__(self, db: NotionDB, conversion_rules: dict):
+class NotionRowConverter(object):  # noqa:  WPS214
+    def __init__(self, db: NotionDB, conversion_rules: ConversionRules):
         self.db = db
         self.rules = conversion_rules
 
-    def prepare(self, csv_data):
-        self._validate_image_column(csv_data.keys())
-        self._validate_image_caption_column(csv_data.keys())
-        self._validate_icon_column(csv_data.keys())
-        self._vlaidate_mandatory_columns(csv_data.keys())
+        self._current_row = 0
 
-        if self.rules["is_merge"]:
-            self._validate_key_column(csv_data.keys()[0])
+    def convert_to_notion_rows(self, csv_data: CSVData) -> List[NotionUploadRow]:
+        notion_rows = []
 
-            if self.rules["merge_only_columns"]:
-                self._vlaidate_merge_only_columns(csv_data.keys())
-                ignored_columns = set(csv_data.keys()[1:]) - set(
-                    self.rules["merge_only_columns"]
-                )
-                _drop_columns(ignored_columns, csv_data)
+        # starting with 2nd row, because first is header
+        self._current_row = 2
 
-        missing_columns = self._get_missing_columns(csv_data.keys())
-        if missing_columns:
-            if self.rules["missing_columns_action"] == "add":
-                self._add_columns(missing_columns, csv_data)
-            elif self.rules["missing_columns_action"] == "fail":
-                raise NotionError(
-                    f"CSV columns missing from Notion DB: {missing_columns}"
-                )
-
-        inaccessible_relations = self._get_inaccessible_relations(csv_data.keys())
-        if inaccessible_relations:
-            if self.rules["fail_on_inaccessible_relations"]:
-                raise NotionError(
-                    f"Columns with inaccessible relations: {inaccessible_relations}"
-                )
-            _drop_columns(inaccessible_relations, csv_data)
-
-        if self.rules["fail_on_relation_duplicates"]:
-            self._validate_relations_duplicates(csv_data.keys())
-
-        if self.rules["fail_on_duplicates"]:
-            _validate_csv_duplicates(csv_data)
-            self._validate_db_duplicates()
-
-    def convert_to_notion_rows(self, csv_data: CSVData):
-        result = []
-        for i, row in enumerate(csv_data, 2):
+        for row in csv_data:
             try:
-                result.append(self._convert_row(row))
+                notion_rows.append(self._convert_row(row))
             except NotionError as e:
-                raise NotionError(f"CSV [{i}]: {e}")
+                raise NotionError(f"CSV [{self._current_row}]: {e}")
+            self._current_row += 1
 
-        return result
+        return notion_rows
 
-    def _add_columns(self, columns, csv_data: CSVData):
-        for column in columns:
-            self.db.add_column(column, csv_data.col_type(column))
+    def _error(self, error: str) -> None:
+        logger.error(f"CSV [{self._current_row}]: {error}")
 
-    def _convert_row(self, row):
+        if self.rules.fail_on_conversion_error:
+            raise NotionError("Error during conversion.")
+
+    def _convert_row(self, row: CSVRowType) -> NotionUploadRow:
+        properties = self._map_properties(row)
+        columns = self._map_columns(row)
+
+        return NotionUploadRow(columns=columns, properties=properties)
+
+    def _map_properties(self, row: CSVRowType) -> Dict[str, Any]:
+        properties = {}
+
+        if self.rules.image_column_mode == "block":
+            properties["cover_block"] = self._map_image(row)
+            properties["cover_block_caption"] = self._map_image_caption(row)
+        else:
+            properties["cover"] = self._map_image(row)
+
+        properties["icon"] = self._map_icon(row)
+
+        properties["created_time"] = self._pop_column_type(row, "created_time")
+        properties["last_edited_time"] = self._pop_column_type(row, "last_edited_time")
+
+        return {k: v for k, v in properties.items() if v is not None}
+
+    def _map_columns(self, row: CSVRowType) -> Dict[str, Any]:
         notion_row = {}
 
-        image = self._map_image(row)
-        image_caption = self._map_image_caption(row)
-        icon = self._map_icon(row)
+        for col_key, col_value in row.items():
+            col_type = self.db.columns[col_key]["type"]
 
-        for key, value in row.items():
-            if not self.db.schema.get(key):
-                continue
+            notion_row[col_key] = self._map_column(col_key, col_value, col_type)
 
-            value_type = self.db.schema[key]["type"]
+            self._raise_if_mandatory_empty(col_key, notion_row[col_key])
 
-            conversion_map = {
-                "relation": partial(self._map_relation, key),
-                "checkbox": map_checkbox,
-                "date": map_date,
-                "multi_select": split_str,
-                "number": map_number,
-            }
+        return notion_row
 
-            try:
-                notion_row[key] = conversion_map[value_type](value)
-            except KeyError:
-                notion_row[key] = value
-            except TypeConversionError as e:
-                if value == "" or not self.rules["fail_on_conversion_error"]:
-                    notion_row[key] = None
-                else:
-                    raise NotionError(e) from e
+    def _map_column(
+        self, col_key: str, col_value: str, value_type: str
+    ) -> Optional[Any]:
+        conversion_map: Dict[str, Callable[[str], Any]] = {
+            "relation": partial(self._map_relation, col_key),
+            "checkbox": map_checkbox,
+            "date": map_notion_date,
+            "created_time": map_date,
+            "last_edited_time": map_date,
+            "multi_select": split_str,
+            "number": map_number,
+            "file": self._map_file,
+            "person": self._map_person,
+        }
 
-            if key in self.rules["mandatory_columns"] and not notion_row[key]:
-                raise NotionError(f"Mandatory column '{key}' is empty")
+        try:
+            return conversion_map[value_type](col_value)
+        except KeyError:
+            return col_value
+        except TypeConversionError as e:
+            if not col_value.strip():
+                return None
 
-        return NotionUploadRow(notion_row, image, image_caption, icon)
+            self._error(str(e))
+            return None
 
-    def _map_icon(self, row):
-        icon = None
+    def _pop_column_type(self, row: CSVRowType, col_type_to_pop: str) -> Optional[Any]:
+        """Some column types can't have multiple values (like created_time)
+        so we pop them out of the row leaving only the last non-empty one"""
 
-        if self.rules["icon_column"]:
-            icon = row.get(self.rules["icon_column"], "").strip()
+        last_col_value = None
+
+        for col_key, col_value in list(row.items()):
+            col_type = self.db.columns[col_key]["type"]
+
+            if col_type == col_type_to_pop:
+                result_value = self._map_column(col_key, col_value, col_type)
+
+                self._raise_if_mandatory_empty(col_key, result_value)
+
+                if result_value is not None:
+                    last_col_value = result_value
+
+                row.pop(col_key)
+
+        return last_col_value
+
+    def _map_icon(self, row: CSVRowType) -> Optional[FileType]:
+        icon: Optional[FileType] = None
+
+        if self.rules.icon_column:
+            icon = row.get(self.rules.icon_column, "").strip()
             if icon:
                 icon = map_icon(icon)
                 if isinstance(icon, Path):
                     icon = self._relative_path(icon)
-            elif self.rules["icon_column"] in self.rules["mandatory_columns"]:
-                raise NotionError(
-                    f"Mandatory column '{self.rules['icon_column']}' is empty"
-                )
-            else:
-                icon = None
 
-            if not self.rules["icon_column_keep"]:
-                row.pop(self.rules["icon_column"], None)
+            self._raise_if_mandatory_empty(self.rules.icon_column, icon)
 
-        if not icon and self.rules["default_icon"]:
-            icon = self.rules["default_icon"]
+            if not self.rules.icon_column_keep:
+                row.pop(self.rules.icon_column, None)
+
+        if not icon and self.rules.default_icon:
+            icon = self.rules.default_icon
 
         return icon
 
-    def _map_image(self, row):
-        image = None
-        if self.rules["image_column"]:
-            image = row.get(self.rules["image_column"], "").strip()
+    def _map_image(self, row: CSVRowType) -> Optional[FileType]:
+        image: Optional[FileType] = None
+
+        if self.rules.image_column:
+            image = row.get(self.rules.image_column, "").strip()
             if image:
-                image = map_image(image)
+                image = map_url_or_file(image)
                 if isinstance(image, Path):
                     image = self._relative_path(image)
-            elif self.rules["image_column"] in self.rules["mandatory_columns"]:
-                raise NotionError(
-                    f"Mandatory column '{self.rules['image_column']}' is empty"
-                )
-            else:
-                image = None
 
-            if not self.rules["image_column_keep"]:
-                row.pop(self.rules["image_column"], None)
+            self._raise_if_mandatory_empty(self.rules.image_column, image)
+
+            if not self.rules.image_column_keep:
+                row.pop(self.rules.image_column, None)
+
         return image
 
-    def _map_image_caption(self, row):
+    def _map_image_caption(self, row: CSVRowType) -> Optional[str]:
         image_caption = None
-        if self.rules["image_caption_column"]:
-            image_caption = row.get(self.rules["image_caption_column"], "").strip()
-            if not image_caption and self._is_mandatory(
-                self.rules["image_caption_column"]
-            ):
-                raise NotionError(
-                    f"Mandatory column '{self.rules['image_caption_column']}' is empty"
-                )
 
-            if not self.rules["image_caption_column_keep"]:
-                row.pop(self.rules["image_caption_column"], None)
+        if self.rules.image_caption_column:
+            image_caption = row.get(self.rules.image_caption_column, "").strip()
+
+            self._raise_if_mandatory_empty(
+                self.rules.image_caption_column, image_caption
+            )
+
+            if not self.rules.image_caption_column_keep:
+                row.pop(self.rules.image_caption_column, None)
+
         return image_caption
 
-    def _is_mandatory(self, key):
-        return key in self.rules["mandatory_columns"]
+    def _map_file(self, s: str) -> List[FileType]:
+        col_value = split_str(s)
 
-    def _relative_path(self, path):
-        search_path = self.rules["files_search_path"]
+        resolved_uris = []
+        for v in col_value:
+            file_uri = map_url_or_file(v)
 
-        path = Path(path)
+            if isinstance(file_uri, Path):
+                rel_file_uri = self._ensure_path(file_uri)
+
+                if rel_file_uri is None:
+                    continue
+
+                file_uri = rel_file_uri
+
+            if file_uri not in resolved_uris:
+                resolved_uris.append(file_uri)
+
+        return resolved_uris
+
+    def _ensure_path(self, path: Path) -> Optional[Path]:
+        ensured_path = self._relative_path(path)
+        if ensured_path is None:
+            return None
+
+        if _is_banned_extension(ensured_path):
+            self._error(
+                f"File extension '*{ensured_path.suffix}' is not allowed"
+                f" to upload on Notion."
+            )
+            return None
+
+        return ensured_path
+
+    def _relative_path(self, path: Path) -> Optional[Path]:
+        search_path = self.rules.files_search_path
 
         if not path.is_absolute():
             path = search_path / path
 
         if not path.exists():
-            raise NotionError(f"File {path.name} does not exist")
+            self._error(f"File {path.name} does not exist.")
+            return None
 
         return path
 
-    def _map_relation(self, relation_column, value):
-        value = split_str(value)
+    def _map_relation(
+        self, relation_column: str, col_value: str
+    ) -> List[CollectionRowBlockExtended]:
+        col_values = split_str(col_value)
 
-        relation = self.db.relation(relation_column)
+        resolved_relations = []
+        for v in col_values:
+            if v.startswith("https://www.notion.so/"):
+                resolved_relation = self._resolve_relation_by_url(relation_column, v)
+            else:
+                resolved_relation = self._resolve_relation_by_key(relation_column, v)
 
-        result = []
-        for v in value:
-            try:
-                result.append(relation["rows"][v])
-            except KeyError:
-                if self.rules["missing_relations_action"] == "add":
-                    self.db.add_relation_row(relation_column, v)
-                    result.append(relation["rows"][v])
-                elif self.rules["missing_relations_action"] == "ignore":
-                    continue
-                elif self.rules["missing_relations_action"] == "fail":
-                    raise NotionError(
-                        f"Value '{v}' for relation"
-                        f" '{relation_column} [column] -> {relation['name']} [DB]'"
-                        f" is not a valid value."
-                    )
-        return result
+            if resolved_relation and resolved_relation not in resolved_relations:
+                resolved_relations.append(resolved_relation)
 
-    def _validate_db_duplicates(self):
-        if self.db.is_db_has_duplicates():
-            raise NotionError("Duplicate values found in DB key column.")
+        return resolved_relations
 
-    def _validate_relations_duplicates(self, keys):
-        relation_keys = [
-            s_name
-            for s_name, s in self.db.schema.items()
-            if s["type"] == "relation" and s_name in keys
-        ]
+    def _resolve_relation_by_key(
+        self, relation_column: str, key: str
+    ) -> Optional[CollectionRowBlockExtended]:
+        relation = self.db.relations[relation_column]
 
-        for relation in relation_keys:
-            if self.db.is_relation_has_duplicates(relation):
-                relation_name = self.db.relation(relation)["name"]
-                raise NotionError(
-                    f"Collection DB '{relation_name}' used in '{relation}'"
-                    f" relation column has duplicates which"
-                    f" cannot be unambiguously mapped with CSV data."
-                )
+        try:
+            return relation.rows[key]
+        except KeyError:
+            if self.rules.add_missing_relations:
+                return relation.add_row_key(key)
 
-    def _get_inaccessible_relations(self, keys):
-        relation_keys = [
-            s_name
-            for s_name, s in self.db.schema.items()
-            if s["type"] == "relation" and s_name in keys
-        ]
-
-        inaccessible_relations = []
-
-        for relation_key in relation_keys:
-            try:
-                self.db.relation(relation_key)
-            except KeyError:
-                inaccessible_relations.append(relation_key)
-
-        return inaccessible_relations
-
-    def _get_missing_columns(self, column_keys):
-        csv_keys = set(column_keys)
-        schema_keys = set(self.db.schema)
-
-        if self.rules["image_column"] and not self.rules["image_column_keep"]:
-            csv_keys -= {self.rules["image_column"]}
-
-        if (
-            self.rules["image_caption_column"]
-            and not self.rules["image_caption_column_keep"]
-        ):
-            csv_keys -= {self.rules["image_caption_column"]}
-
-        if self.rules["icon_column"] and not self.rules["icon_column_keep"]:
-            csv_keys -= {self.rules["icon_column"]}
-
-        return csv_keys - schema_keys
-
-    def _validate_key_column(self, key_column: str):
-        if key_column not in self.db.schema:
-            raise NotionError(f"Key column '{key_column}' does not exist in Notion DB.")
-        if self.db.schema[key_column]["type"] != "title":
-            raise NotionError(f"Notion DB column '{key_column}' is not a key column.")
-
-    def _validate_image_column(self, csv_keys):
-        if self.rules["image_column"] and self.rules["image_column"] not in csv_keys:
-            raise NotionError(
-                f"Image column '{self.rules['image_column']}' not found in csv file."
+            self._error(
+                f"Value '{key}' for relation"
+                f" '{relation_column} [column] -> {relation.name} [DB]'"
+                f" is not a valid value."
             )
 
-    def _validate_image_caption_column(self, csv_keys):
-        if (
-            self.rules["image_caption_column"]
-            and self.rules["image_caption_column"] not in csv_keys
-        ):
-            raise NotionError(
-                f"Image caption column '{self.rules['image_caption_column']}'"
-                f" not found in csv file."
+            return None
+
+    def _resolve_relation_by_url(
+        self, relation_column: str, url: str
+    ) -> Optional[CollectionRowBlockExtended]:
+        block_id = self._extract_id(url)
+        if block_id is None:
+            return None
+
+        relation = self.db.relations[relation_column]
+        relation_rows = relation.rows.values()
+
+        try:
+            return next(r for r in relation_rows if r.id == block_id)
+        except StopIteration:
+            self._error(
+                f"Row with url '{url}' not found in relation"
+                f" '{relation_column} [column] -> {relation.name} [DB]'."
             )
 
-    def _validate_icon_column(self, csv_keys):
-        if self.rules["icon_column"] and self.rules["icon_column"] not in csv_keys:
-            raise NotionError(
-                f"Icon column '{self.rules['icon_column']}' not found in csv file."
-            )
+            return None
 
-    def _vlaidate_mandatory_columns(self, csv_keys):
-        missing_columns = set(self.rules["mandatory_columns"]) - set(csv_keys)
-        if missing_columns:
-            raise NotionError(
-                f"Mandatory column(s) {missing_columns} not found in csv file."
-            )
+    def _extract_id(self, url: str) -> Optional[str]:
+        try:
+            return str(extract_id(url))
+        except InvalidNotionIdentifier:
+            self._error(f"'{url}' is not a valid Notion URL.")
 
-    def _vlaidate_merge_only_columns(self, csv_keys):
-        missing_columns = set(self.rules["merge_only_columns"]) - set(csv_keys)
-        if missing_columns:
-            raise NotionError(
-                f"Merge only column(s) {missing_columns} not found in csv file."
-            )
+            return None
+
+    def _map_person(self, col_value: str) -> List[User]:
+        col_values = split_str(col_value)
+
+        resolved_persons = []
+        for v in col_values:
+            if is_email(v):
+                resolved_person = self.db.users.get(v)
+
+                if not resolved_person:
+                    resolved_person = self.db.find_user(v)
+            else:
+                resolved_person = self.db.get_user_by_name(v)
+
+            if resolved_person is None:
+                self._error(f"Person '{v}' cannot be resolved.")
+                continue
+
+            if resolved_person not in resolved_persons:
+                resolved_persons.append(resolved_person)
+
+        return resolved_persons
+
+    def _raise_if_mandatory_empty(self, col_key: str, col_value: Any) -> None:
+        is_mandatory = col_key in self.rules.mandatory_column
+
+        if is_mandatory and not col_value:
+            raise NotionError(f"Mandatory column '{col_key}' is empty")
+
+
+def _is_banned_extension(file_path: Path) -> bool:
+    return file_path.suffix in {".exe", ".com", ".js"}

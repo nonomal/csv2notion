@@ -1,9 +1,9 @@
-import os
+import logging
 
 import pytest
 
 from csv2notion.cli import cli
-from csv2notion.utils import NotionError
+from csv2notion.utils_exceptions import NotionError
 
 
 @pytest.mark.vcr()
@@ -22,14 +22,12 @@ def test_fail_on_inaccessible_relations(tmp_path, db_maker):
 
     with pytest.raises(NotionError) as e:
         cli(
-            [
-                "--token",
-                db_maker.token,
-                "--url",
-                test_db.url,
-                "--fail-on-inaccessible-relations",
-                str(test_file),
-            ]
+            "--token",
+            db_maker.token,
+            "--url",
+            test_db.url,
+            "--fail-on-inaccessible-relations",
+            str(test_file),
         )
 
     assert "Columns with inaccessible relations: ['b']" in str(e.value)
@@ -37,7 +35,7 @@ def test_fail_on_inaccessible_relations(tmp_path, db_maker):
 
 @pytest.mark.vcr()
 @pytest.mark.usefixtures("vcr_uuid4")
-def test_fail_on_inaccessible_relations_ignore(tmp_path, db_maker):
+def test_fail_on_inaccessible_relations_ignore(tmp_path, db_maker, caplog):
     test_file = tmp_path / "test.csv"
     test_file.write_text("a,b\na,b\n")
 
@@ -49,21 +47,18 @@ def test_fail_on_inaccessible_relations_ignore(tmp_path, db_maker):
     # delete relation page to make it inaccessible
     test_db_relation.remove()
 
-    cli(
-        [
+    with caplog.at_level(logging.INFO, logger="csv2notion"):
+        cli(
             "--token",
             db_maker.token,
             "--url",
             test_db.url,
             str(test_file),
-        ]
-    )
+        )
 
-    table_main_rows = test_db.rows
-    table_main_header = test_db.header
+    assert test_db.header == {"a", "b"}
+    assert len(test_db.rows) == 1
 
-    assert table_main_header == {"a", "b"}
-    assert len(table_main_rows) == 1
-
-    assert getattr(table_main_rows[0], "a") == "a"
-    assert getattr(table_main_rows[0], "b") == []
+    assert test_db.rows[0].columns["a"] == "a"
+    assert test_db.rows[0].columns["b"] == []
+    assert "Columns with inaccessible relations: ['b']" in caplog.text
